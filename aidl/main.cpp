@@ -5,7 +5,13 @@
 
 #define LOG_TAG "android.hardware.health-service.qti"
 
+#include <cerrno>
+#include <climits>
+#include <cstdlib>
+#include <string>
+
 #include <android-base/logging.h>
+#include <android-base/file.h>
 #include <android/binder_interface_utils.h>
 #include <cutils/klog.h>
 #include <cutils/properties.h>
@@ -31,6 +37,7 @@ static const enum soc_id target_no_psy[] = {
         MSM_SERAPHP,
 };
 
+using aidl::android::hardware::health::HealthInfo;
 using aidl::android::hardware::health::HalHealthLoop;
 using aidl::android::hardware::health::Health;
 
@@ -48,6 +55,9 @@ class ChargerCallbackImpl : public ChargerCallback {
 
 static constexpr const char* gInstanceName = "default";
 static constexpr std::string_view gChargerArg{"--charger"};
+static constexpr const char* kUsbOnlinePath = "/sys/class/power_supply/usb/online";
+static constexpr const char* kUsbCurrentNowPath = "/sys/class/power_supply/usb/current_now";
+static constexpr const char* kUsbVoltageNowPath = "/sys/class/power_supply/usb/voltage_now";
 
 static constexpr std::array<std::string_view, 3> ucsiPSYNames = {
         "ucsi-source-psy-soc:qcom,pmic_glink:qcom,ucsi1",
@@ -56,6 +66,46 @@ static constexpr std::array<std::string_view, 3> ucsiPSYNames = {
 };
 
 #define RETRY_COUNT    100
+
+static bool ReadIntFromFile(const char* path, int* value) {
+    std::string content;
+    if (!android::base::ReadFileToString(path, &content, true)) {
+        return false;
+    }
+
+    errno = 0;
+    char* end = nullptr;
+    long parsed = strtol(content.c_str(), &end, 10);
+    if (end == content.c_str() || errno != 0 || parsed < INT_MIN || parsed > INT_MAX) {
+        return false;
+    }
+
+    *value = static_cast<int>(parsed);
+    return true;
+}
+
+class QtiHealth : public Health {
+  public:
+    QtiHealth(std::string_view instance_name, std::unique_ptr<healthd_config>&& config)
+        : Health(instance_name, std::move(config)) {}
+
+  protected:
+    void UpdateHealthInfo(HealthInfo* health_info) override {
+        int online = 0;
+        if (!ReadIntFromFile(kUsbOnlinePath, &online) || online <= 0) {
+            return;
+        }
+
+        int value = 0;
+        if (ReadIntFromFile(kUsbCurrentNowPath, &value) && value > 0) {
+            health_info->maxChargingCurrentMicroamps = value;
+        }
+
+        if (ReadIntFromFile(kUsbVoltageNowPath, &value) && value > 0) {
+            health_info->maxChargingVoltageMicrovolts = value;
+        }
+    }
+};
 
 void qti_healthd_board_init(struct healthd_config *hc)
 {
@@ -131,7 +181,7 @@ int main(int argc, char** argv) {
     auto config = std::make_unique<healthd_config>();
     ::android::hardware::health::InitHealthdConfig(config.get());
     qti_healthd_board_init(config.get());
-    auto binder = ndk::SharedRefBase::make<Health>(gInstanceName, std::move(config));
+    auto binder = ndk::SharedRefBase::make<QtiHealth>(gInstanceName, std::move(config));
 
     if (argc >= 2 && argv[1] == gChargerArg) {
 #if !CHARGER_FORCE_NO_UI
